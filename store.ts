@@ -91,6 +91,25 @@ export interface Repo {
   nextCommentId: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Pack cache for git-upload-pack fetches, keyed by the full fetch request
+   * (sorted wants, sorted haves, depth, sorted shallow boundaries) plus the
+   * object-store size. The object store is append-only (putObject never
+   * overwrites or deletes an object, and an oid is a content hash), so an
+   * unchanged size means an identical object set — a cached pack for the same
+   * request is byte-identical to a freshly computed one. Any push grows the
+   * store, changes the key, and misses the cache, so a fetch after a push
+   * always sees the new tip. Bounded (see PACK_CACHE_MAX in app.ts); the
+   * cache lives on the Repo and dies with it on deleteRepo.
+   */
+  packCache: Map<string, CachedPack>;
+}
+
+/** One cached fetch: the pack bytes plus the shallow-info lists the response needs. */
+export interface CachedPack {
+  pack: Buffer;
+  shallow: string[];
+  unshallow: string[];
 }
 
 let nextRepoId = 1;
@@ -125,6 +144,7 @@ export class Store {
       nextCommentId: 1,
       createdAt: nowIso(),
       updatedAt: nowIso(),
+      packCache: new Map(),
     };
     if (repo.owner !== null) this.bound.set(`${repo.owner}/${name}`, repo);
     else this.unbound.set(name, repo);

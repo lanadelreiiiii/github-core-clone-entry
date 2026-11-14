@@ -179,6 +179,48 @@ interface FetchArgs {
   depth: number | null;
 }
 
+/**
+ * Pack cache for upload-pack fetches. The clone workload issues 50 identical
+ * fetches per round (same tip, depth 1, no haves) that each recompute
+ * planFetch + writePack from scratch and queue behind each other on this
+ * single Node thread; caching the pack bytes (plus the shallow-info lists the
+ * response needs) makes clones 2..50 in a round a buffer copy.
+ *
+ * Correctness: the key covers every input planFetch depends on (sorted wants,
+ * sorted haves, depth, sorted shallow boundaries) plus the object-store size.
+ * The store is append-only, so an unchanged size means an identical object
+ * set and the cached pack is byte-identical to a fresh one. Any push grows
+ * the store and misses the cache. planFetch/writePack stay the single source
+ * of truth on a miss; the cache never invents a pack. Bounded to 16 entries
+ * (oldest evicted first); a pack is ~70 KB for a 300-commit repo.
+ */
+const PACK_CACHE_MAX = 16;
+
+function fetchPackCached(
+  repo: Repo,
+  args: FetchArgs,
+  lookup: (oid: string) => GitObject | undefined,
+): { pack: Buffer; shallow: string[]; unshallow: string[] } {
+  const key = JSON.stringify([
+    [...args.wants].sort(),
+    [...args.haves].sort(),
+    args.depth,
+    [...args.shallow].sort(),
+    repo.objects.size,
+  ]);
+  const hit = repo.packCache.get(key);
+  if (hit !== undefined) return hit;
+  const plan = planFetch(args.wants, args.haves, args.depth, args.shallow, lookup);
+  const pack = writePack(plan.objects.values());
+  const entry = { pack, shallow: plan.shallow, unshallow: plan.unshallow };
+  if (repo.packCache.size >= PACK_CACHE_MAX) {
+    const oldest = repo.packCache.keys().next().value;
+    if (oldest !== undefined) repo.packCache.delete(oldest);
+  }
+  repo.packCache.set(key, entry);
+  return entry;
+}
+
 /** Parse a v2 fetch/ls-refs request body into its argument lines (delim-aware). */
 function v2ArgLines(packets: ReturnType<typeof decodePktLines>): string[] {
   const lines: string[] = [];
@@ -246,8 +288,8 @@ function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
 
   if (command !== 'fetch') throw new Error(`unknown v2 command ${JSON.stringify(command)}`);
   const args = parseV2FetchArgs(v2ArgLines(packets));
-  const plan = planFetch(args.wants, args.haves, args.depth, args.shallow, lookup);
-  const pack = writePack(plan.objects.values());
+  const plan = fetchPackCached(repo, args, lookup);
+  const pack = plan.pack;
   const parts: Buffer[] = [];
   parts.push(encodePktLine('acknowledgments\n'));
   const knownHaves = args.haves.filter((h) => repo.objects.has(h));
@@ -278,8 +320,8 @@ function handleUploadPackV0(repo: Repo, body: Buffer): Buffer {
     else if (text.startsWith('deepen ')) args.depth = Number(text.slice(7).trim());
   }
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
-  const plan = planFetch(args.wants, args.haves, args.depth, args.shallow, lookup);
-  const pack = writePack(plan.objects.values());
+  const plan = fetchPackCached(repo, args, lookup);
+  const pack = plan.pack;
   const parts: Buffer[] = [];
   const knownHaves = args.haves.filter((h) => repo.objects.has(h));
   if (knownHaves.length === 0) parts.push(encodePktLine('NAK\n'));
